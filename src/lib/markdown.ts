@@ -37,6 +37,7 @@ export const parseMarkdown = (markdown: string): Segment[] => {
     status: 'draft' as const,
     protectedTokens: extractProtected(block.text),
     note: '',
+    claimerId: null,
   }))
 }
 
