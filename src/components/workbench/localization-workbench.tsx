@@ -5,8 +5,8 @@ import { useMutation, useQuery } from '@tanstack/react-query'
 import {
   AlertCircle, ArrowDown, ArrowUp, BookOpen, Check, CheckCheck, ChevronLeft, ChevronRight,
   CircleAlert, Cloud, CloudOff, Code2, Download, FileText, GitCompare, History, Import,
-  Languages, Link2, Loader2, MessageSquare, RefreshCw, RotateCcw, RotateCw, Save, Search,
-  Send, ShieldCheck, Sparkles, Undo2, UndoDot, Variable, X,
+  Languages, Link2, Loader2, Lock, MessageSquare, RefreshCw, RotateCcw, RotateCw, Save, Search,
+  Send, ShieldCheck, Sparkles, Undo2, UndoDot, UserCheck, UserPlus, Variable, X,
 } from 'lucide-react'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -17,10 +17,13 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { Textarea } from '@/components/ui/textarea'
 import { analyzeDocument, extractVariables, parseMarkdown, renderTargetMarkdown } from '@/lib/markdown'
 import { seedConflicts, seedDiscussions, seedDocument, seedGlossary, seedHistory, seedSegments } from '@/lib/seed'
-import type { Discussion, GlossaryTerm, HistoryEntry, Segment, SegmentStatus, TranslationConflict, TranslationIssue } from '@/lib/types'
+import type { Discussion, GlossaryTerm, HistoryEntry, PendingReturn, ReviewResult, Segment, SegmentStatus, TranslationConflict, TranslationIssue } from '@/lib/types'
 import { cn } from '@/lib/utils'
 
 const DRAFT_KEY = 'sologsb-1003-localization-draft-v1'
+/** 当前操作者：在翻译模式下是译者，在审校模式下是审校员 */
+const CURRENT_TRANSLATOR = '译者 · 当前用户'
+const CURRENT_REVIEWER = '审校 · 当前用户'
 const kindIcon = { heading: <FileText className="h-3.5 w-3.5" />, paragraph: <FileText className="h-3.5 w-3.5" />, code: <Code2 className="h-3.5 w-3.5" />, link: <Link2 className="h-3.5 w-3.5" />, variable: <Variable className="h-3.5 w-3.5" /> }
 const kindLabel: Record<Segment['kind'], string> = { heading: '标题', paragraph: '段落', code: '代码块', link: '链接', variable: '占位符' }
 const statusLabel: Record<SegmentStatus, string> = { draft: '草稿', 'needs-work': '待处理', confirmed: '已确认', returned: '已退回' }
@@ -36,6 +39,12 @@ const clone = <T,>(value: T): T => JSON.parse(JSON.stringify(value)) as T
 interface EditorSnapshot {
   segments: Segment[]
   discussions: Discussion[]
+}
+
+interface Toast {
+  id: string
+  message: string
+  kind: 'info' | 'success' | 'error'
 }
 
 export function LocalizationWorkbench() {
@@ -57,6 +66,16 @@ export function LocalizationWorkbench() {
   const [hydrated, setHydrated] = useState(false)
   const [past, setPast] = useState<EditorSnapshot[]>([])
   const [future, setFuture] = useState<EditorSnapshot[]>([])
+  /** 服务端退回失败后留在本地等待重试的请求队列 */
+  const [pendingReturns, setPendingReturns] = useState<PendingReturn[]>([])
+  /** 收到退回结果时，本地有未提交改动被保留下来的片段（两边都留着） */
+  const [keptLocalIds, setKeptLocalIds] = useState<Set<string>>(new Set())
+  const [toasts, setToasts] = useState<Toast[]>([])
+  /** 演示开关：让服务端退回失败，以观察本地重试队列 */
+  const [simulateReviewFailure, setSimulateReviewFailure] = useState(false)
+  /** 上次成功保存/加载时的译文快照，用于识别未提交的本地改动 */
+  const [savedTargets, setSavedTargets] = useState<Record<string, string>>(() => Object.fromEntries(seedSegments.map((segment) => [segment.id, segment.targetText])))
+  const deliveredResultsRef = useRef<Set<string>>(new Set())
 
   const documentQuery = useQuery({
     queryKey: ['localization-document'],
@@ -85,6 +104,26 @@ export function LocalizationWorkbench() {
     },
     initialData: seedConflicts,
   })
+  const reviewResultsQuery = useQuery({
+    queryKey: ['review-results', CURRENT_TRANSLATOR],
+    queryFn: async () => {
+      const response = await fetch(`/api/review-results?author=${encodeURIComponent(CURRENT_TRANSLATOR)}`)
+      if (!response.ok) throw new Error('review-results request failed')
+      return response.json() as Promise<ReviewResult[]>
+    },
+    initialData: [],
+    refetchOnWindowFocus: true,
+  })
+
+  const pushToast = (message: string, kind: Toast['kind'] = 'info') => {
+    const id = `toast-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`
+    setToasts((current) => [...current, { id, message, kind }])
+    setTimeout(() => setToasts((current) => current.filter((toast) => toast.id !== id)), 4600)
+  }
+
+  /** 越权检查：译文有改动但片段不由本人认领时，先在本地挡下 */
+  const findUnauthorizedEdits = (): Segment[] =>
+    segments.filter((segment) => (savedTargets[segment.id] ?? '') !== segment.targetText && segment.claimedBy !== CURRENT_TRANSLATOR)
 
   const checkMutation = useMutation({
     mutationFn: async () => {
@@ -99,20 +138,118 @@ export function LocalizationWorkbench() {
   })
   const saveMutation = useMutation({
     mutationFn: async () => {
-      const response = await fetch('/api/draft', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ documentId: seedDocument.id, segments, discussions }) })
+      const blocked = findUnauthorizedEdits()
+      if (blocked.length) {
+        pushToast(`越权提交已阻止：片段 #${blocked.map((segment) => segment.index).join('、')} 不由你认领，请先认领或只在讨论区留言`, 'error')
+        throw new Error('forbidden-local')
+      }
+      const response = await fetch('/api/draft', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ documentId: seedDocument.id, author: CURRENT_TRANSLATOR, segments: segments.filter((segment) => segment.claimedBy === CURRENT_TRANSLATOR), discussions }) })
+      if (response.status === 403) {
+        const body = await response.json().catch(() => null) as { message?: string } | null
+        pushToast(body?.message ?? '越权提交已被服务端阻止', 'error')
+        throw new Error('forbidden-server')
+      }
       if (!response.ok) throw new Error('save failed')
       return response.json()
     },
     onSuccess: () => {
       setDirty(false)
-      try { localStorage.setItem(DRAFT_KEY, JSON.stringify({ segments, discussions, glossary, history })) } catch { /* storage may be unavailable */ }
+      setSavedTargets(Object.fromEntries(segments.map((segment) => [segment.id, segment.targetText])))
+      try { localStorage.setItem(DRAFT_KEY, JSON.stringify({ segments, discussions, glossary, history, pendingReturns })) } catch { /* storage may be unavailable */ }
+      pushToast('草稿已保存到服务端', 'success')
     },
   })
+  const claimMutation = useMutation({
+    mutationFn: async (payload: { segmentId: string; action: 'claim' | 'release' }) => {
+      const response = await fetch('/api/claim', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ segmentId: payload.segmentId, author: CURRENT_TRANSLATOR, action: payload.action }) })
+      if (response.status === 409) throw new Error('already-claimed')
+      if (response.status === 403) throw new Error('not-owner')
+      if (!response.ok) throw new Error('claim failed')
+      return response.json() as Promise<{ ok: boolean; claimedBy: string | null }>
+    },
+    onSuccess: (_data, payload) => {
+      setSegments((current) => current.map((segment) => segment.id === payload.segmentId
+        ? { ...segment, claimedBy: payload.action === 'claim' ? CURRENT_TRANSLATOR : null, claimedAt: payload.action === 'claim' ? Date.now() : undefined }
+        : segment))
+      pushToast(payload.action === 'claim' ? '认领成功：该片段现在只有你能修改译文' : '已释放认领，其他译者可以认领该片段', 'success')
+    },
+    onError: (_error, payload) => {
+      if (payload.action === 'claim') pushToast('认领失败：该片段已被其他译者抢先认领', 'error')
+      else pushToast('释放认领失败：你不是该片段的认领人', 'error')
+    },
+  })
+  /** 退回结果合并：本地未提交的译文改动原样保留，退回状态与原因同时留下（两边都留着） */
+  const applyReturnResults = (results: { id?: string; segmentId: string; reason?: string; reviewer?: string }[]) => {
+    if (!results.length) return
+    const resultBySegment = new Map(results.map((result) => [result.segmentId, result]))
+    const kept: string[] = []
+    setSegments((current) => current.map((segment) => {
+      const result = resultBySegment.get(segment.id)
+      if (!result) return segment
+      const isOwner = segment.claimedBy === CURRENT_TRANSLATOR
+      const hasLocalEdits = (savedTargets[segment.id] ?? '') !== segment.targetText
+      if (hasLocalEdits) kept.push(segment.id)
+      return {
+        ...segment,
+        status: 'returned',
+        // 认领人本地还没提交的改动不能被退回结果盖掉：译文原样保留
+        targetText: segment.targetText,
+        // 退回原因只发给认领人本人，其他人看不到
+        returnReason: isOwner ? result.reason : undefined,
+        returnedAt: Date.now(),
+        returnResultId: result.id ?? segment.returnResultId,
+        returnPending: false,
+      }
+    }))
+    results.forEach((result) => pushHistoryEntry(result.segmentId, 'return', '', result.reason ?? '退回', result.reviewer ?? CURRENT_REVIEWER))
+    if (kept.length) {
+      const indexes = segments.filter((segment) => kept.includes(segment.id)).map((segment) => segment.index).join('、')
+      setKeptLocalIds((current) => new Set([...current, ...kept]))
+      pushToast(`退回已送达：片段 #${indexes} 有未提交的本地改动，译文已保留，请按退回原因修改后重新提交`, 'info')
+    } else {
+      pushToast('退回已送达：片段已退回，退回原因仅认领人可见', 'info')
+    }
+  }
   const reviewMutation = useMutation({
-    mutationFn: async (payload: { action: string; segmentIds: string[]; reason?: string }) => {
-      const response = await fetch('/api/review', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) })
+    mutationFn: async (payload: { action: 'return' | 'confirm'; segmentIds: string[]; reason?: string }) => {
+      const response = await fetch('/api/review', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...payload, reviewer: CURRENT_REVIEWER, simulateFailure: simulateReviewFailure }) })
+      if (response.status === 503) throw new Error('review-unavailable')
       if (!response.ok) throw new Error('review failed')
-      return response.json()
+      return response.json() as Promise<{ accepted: boolean; action: string; results: ReviewResult[] }>
+    },
+    onSuccess: (data, payload) => {
+      if (payload.action === 'return') {
+        const results = data.results?.length
+          ? data.results.map((result) => ({ id: result.id, segmentId: result.segmentId, reason: result.reason, reviewer: result.reviewer }))
+          : payload.segmentIds.map((segmentId) => ({ id: undefined, segmentId, reason: payload.reason, reviewer: CURRENT_REVIEWER }))
+        // 标记这些结果已投递，避免投递轮询到达时重复应用
+        results.forEach((result) => result.id && deliveredResultsRef.current.add(result.id))
+        applyReturnResults(results)
+        setSelectedForReturn((current) => {
+          const next = new Set(current)
+          payload.segmentIds.forEach((id) => next.delete(id))
+          return next
+        })
+      } else {
+        setSegments((current) => current.map((segment) => payload.segmentIds.includes(segment.id) ? { ...segment, status: 'confirmed', returnPending: false } : segment))
+        payload.segmentIds.forEach((id) => pushHistoryEntry(id, 'confirm', '', '', CURRENT_REVIEWER))
+      }
+      // 从重试队列中移除已成功的请求
+      setPendingReturns((current) => current.filter((pending) => !pending.segmentIds.every((id) => payload.segmentIds.includes(id))))
+      void reviewResultsQuery.refetch()
+    },
+    onError: (_error, payload) => {
+      if (payload.action !== 'return') {
+        pushToast('审校操作提交失败，请重试', 'error')
+        return
+      }
+      // 服务端退回失败：片段留在本地等着重试，状态不回退
+      setPendingReturns((current) => {
+        if (current.some((pending) => pending.segmentIds.join(',') === payload.segmentIds.join(','))) return current
+        return [...current, { tempId: `pending-${Date.now()}`, segmentIds: payload.segmentIds, reason: payload.reason ?? returnReason, action: 'return', createdAt: Date.now() }]
+      })
+      setSegments((current) => current.map((segment) => payload.segmentIds.includes(segment.id) ? { ...segment, returnPending: true } : segment))
+      pushToast('服务端退回失败：片段已留在本地，等待重试', 'error')
     },
   })
 
@@ -136,18 +273,28 @@ export function LocalizationWorkbench() {
   const filteredGlossary = glossary.filter((term) => `${term.source} ${term.target}`.toLowerCase().includes(glossarySearch.toLowerCase()))
   const selectedDiscussions = discussions.filter((discussion) => discussion.segmentId === selectedSegment?.id)
   const mockConnected = documentQuery.isFetched && historyQuery.isFetched && conflictQuery.isFetched
+  /** 译文已改动但尚未成功保存的片段（退回到达时这些本地改动必须保留） */
+  const dirtySegmentIds = useMemo(() => new Set(segments.filter((segment) => (savedTargets[segment.id] ?? '') !== segment.targetText).map((segment) => segment.id)), [segments, savedTargets])
+  const pendingReturnIds = useMemo(() => new Set(pendingReturns.flatMap((pending) => pending.segmentIds)), [pendingReturns])
 
   useEffect(() => {
     if (hydrated) return
     try {
       const raw = localStorage.getItem(DRAFT_KEY)
       if (raw) {
-        const draft = JSON.parse(raw) as { segments: Segment[]; discussions: Discussion[]; glossary: GlossaryTerm[]; history: HistoryEntry[] }
+        const draft = JSON.parse(raw) as { segments: Segment[]; discussions: Discussion[]; glossary: GlossaryTerm[]; history: HistoryEntry[]; pendingReturns?: PendingReturn[] }
         if (draft.segments?.length) {
           setSegments(draft.segments)
           setDiscussions(draft.discussions ?? seedDiscussions)
           setGlossary(draft.glossary ?? seedGlossary)
           setHistory(draft.history ?? seedHistory)
+          setSavedTargets(Object.fromEntries(draft.segments.map((segment) => [segment.id, segment.targetText])))
+          deliveredResultsRef.current = new Set(draft.segments.map((segment) => segment.returnResultId).filter((id): id is string => !!id))
+          if (draft.pendingReturns?.length) {
+            setPendingReturns(draft.pendingReturns)
+            const waitingIds = new Set(draft.pendingReturns.flatMap((pending) => pending.segmentIds))
+            setSegments((current) => current.map((segment) => waitingIds.has(segment.id) ? { ...segment, returnPending: true } : segment))
+          }
         }
       }
     } catch { /* start from seed */ }
@@ -156,8 +303,18 @@ export function LocalizationWorkbench() {
 
   useEffect(() => {
     if (!hydrated) return
-    try { localStorage.setItem(DRAFT_KEY, JSON.stringify({ segments, discussions, glossary, history })) } catch { /* storage may be unavailable */ }
-  }, [discussions, glossary, history, hydrated, segments])
+    try { localStorage.setItem(DRAFT_KEY, JSON.stringify({ segments, discussions, glossary, history, pendingReturns })) } catch { /* storage may be unavailable */ }
+  }, [discussions, glossary, history, hydrated, segments, pendingReturns])
+
+  // 投递服务端下发的退回结果：原因只到认领人，本地未提交改动原样保留
+  useEffect(() => {
+    const results = reviewResultsQuery.data ?? []
+    const fresh = results.filter((result) => !deliveredResultsRef.current.has(result.id))
+    if (!fresh.length) return
+    fresh.forEach((result) => deliveredResultsRef.current.add(result.id))
+    applyReturnResults(fresh.map((result) => ({ id: result.id, segmentId: result.segmentId, reason: result.reason, reviewer: result.reviewer })))
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [reviewResultsQuery.data])
 
   useEffect(() => {
     const beforeUnload = (event: BeforeUnloadEvent) => {
@@ -170,6 +327,14 @@ export function LocalizationWorkbench() {
   }, [dirty])
 
   const snapshot = (): EditorSnapshot => ({ segments: clone(segments), discussions: clone(discussions) })
+  /** 认领状态不属于编辑内容，撤销/重做时保留当前认领与退回投递状态 */
+  const preserveClaimFields = (restored: Segment[]): Segment[] =>
+    restored.map((snapshotSegment) => {
+      const current = segments.find((item) => item.id === snapshotSegment.id)
+      return current
+        ? { ...snapshotSegment, claimedBy: current.claimedBy, claimedAt: current.claimedAt, returnReason: current.returnReason, returnedAt: current.returnedAt, returnResultId: current.returnResultId, returnPending: current.returnPending }
+        : snapshotSegment
+    })
   const pushHistoryEntry = (segmentId: string, action: HistoryEntry['action'], before: string, after: string, author = '当前用户') => {
     setHistory((current) => [{ id: `history-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`, segmentId, author, action, before, after, createdAt: Date.now() }, ...current])
   }
@@ -182,23 +347,32 @@ export function LocalizationWorkbench() {
     if (markDirty) setDirty(true)
   }
   const updateTarget = (segment: Segment, targetText: string) => {
-    const next = segments.map((item) => item.id === segment.id ? { ...item, targetText, status: item.status === 'confirmed' ? 'draft' as const : item.status } : item)
+    if (segment.claimedBy !== CURRENT_TRANSLATOR) {
+      pushToast(`越权修改已阻止：该片段由 ${segment.claimedBy ?? '其他译者'} 认领，你只能在讨论区留言`, 'error')
+      return
+    }
+    const next = segments.map((item) => item.id === segment.id
+      ? { ...item, targetText, status: item.status === 'confirmed' || item.status === 'returned' ? 'draft' as const : item.status, returnReason: item.status === 'returned' ? undefined : item.returnReason }
+      : item)
     replaceState({ segments: next, discussions: clone(discussions) })
   }
-  const updateStatus = (segmentId: string, status: SegmentStatus, action: HistoryEntry['action'] = status === 'confirmed' ? 'confirm' : 'return') => {
-    const segment = segments.find((item) => item.id === segmentId)
-    if (!segment) return
-    const next = segments.map((item) => item.id === segmentId ? { ...item, status } : item)
-    replaceState({ segments: next, discussions: clone(discussions) })
-    pushHistoryEntry(segmentId, action, segment.targetText, segment.targetText)
-    setSelectedForReturn((current) => { const copy = new Set(current); copy.delete(segmentId); return copy })
+  /** 审校确认：走服务端审校接口，越权/失败由服务端与重试队列处理 */
+  const requestConfirm = (segmentId: string) => {
+    reviewMutation.mutate({ action: 'confirm', segmentIds: [segmentId] })
+  }
+  /** 审校退回：原因只发给认领人；失败则片段留在本地等重试 */
+  const requestReturn = (segmentId: string) => {
+    reviewMutation.mutate({ action: 'return', segmentIds: [segmentId], reason: returnReason })
+  }
+  const retryPendingReturn = (pending: PendingReturn) => {
+    reviewMutation.mutate({ action: 'return', segmentIds: pending.segmentIds, reason: pending.reason })
   }
   const undo = () => {
     const previous = past.at(-1)
     if (!previous) return
     setFuture((current) => [snapshot(), ...current])
     setPast((current) => current.slice(0, -1))
-    setSegments(previous.segments)
+    setSegments(preserveClaimFields(previous.segments))
     setDiscussions(previous.discussions)
     setCheckedIssues(null)
     setDirty(true)
@@ -208,7 +382,7 @@ export function LocalizationWorkbench() {
     if (!next) return
     setPast((current) => [...current, snapshot()])
     setFuture((current) => current.slice(1))
-    setSegments(next.segments)
+    setSegments(preserveClaimFields(next.segments))
     setDiscussions(next.discussions)
     setCheckedIssues(null)
     setDirty(true)
@@ -234,11 +408,7 @@ export function LocalizationWorkbench() {
   const bulkReturn = () => {
     if (!selectedForReturn.size) return
     const ids = Array.from(selectedForReturn)
-    const next = segments.map((segment) => ids.includes(segment.id) ? { ...segment, status: 'returned' as const } : segment)
-    replaceState({ segments: next, discussions: clone(discussions) })
-    ids.forEach((id) => pushHistoryEntry(id, 'return', returnReason, `退回原因：${returnReason}`, '审校 · 当前用户'))
-    void reviewMutation.mutateAsync({ action: 'bulk-return', segmentIds: ids, reason: returnReason })
-    setSelectedForReturn(new Set())
+    reviewMutation.mutate({ action: 'return', segmentIds: ids, reason: returnReason })
   }
   const resolveConflict = (conflict: TranslationConflict, strategy: 'local' | 'remote') => {
     const targetText = strategy === 'local' ? conflict.localText : conflict.remoteText
@@ -254,6 +424,10 @@ export function LocalizationWorkbench() {
     const imported = parseMarkdown(await file.text())
     if (!imported.length) return
     replaceState({ segments: imported, discussions: [] })
+    setSavedTargets(Object.fromEntries(imported.map((segment) => [segment.id, segment.targetText])))
+    setPendingReturns([])
+    setKeptLocalIds(new Set())
+    deliveredResultsRef.current = new Set()
     pushHistoryEntry(imported[0].id, 'import', '', file.name)
     setSelectedSegmentId(imported[0].id)
     event.target.value = ''
@@ -285,8 +459,8 @@ export function LocalizationWorkbench() {
       if (editing) return
       if (event.key.toLowerCase() === 'j') { event.preventDefault(); nextIssue(1) }
       if (event.key.toLowerCase() === 'k') { event.preventDefault(); nextIssue(-1) }
-      if (event.key.toLowerCase() === 'c' && selectedSegment && mode === 'review') updateStatus(selectedSegment.id, 'confirmed')
-      if (event.key.toLowerCase() === 'r' && selectedSegment && mode === 'review') updateStatus(selectedSegment.id, 'returned')
+      if (event.key.toLowerCase() === 'c' && selectedSegment && mode === 'review') requestConfirm(selectedSegment.id)
+      if (event.key.toLowerCase() === 'r' && selectedSegment && mode === 'review') requestReturn(selectedSegment.id)
     }
     window.addEventListener('keydown', onKeyDown)
     return () => window.removeEventListener('keydown', onKeyDown)
@@ -302,6 +476,7 @@ export function LocalizationWorkbench() {
           </div>
           <div className="hidden items-center gap-2 md:flex">
             <Badge className={cn(mockConnected ? 'bg-emerald-500/15 text-emerald-300' : 'bg-amber-500/15 text-amber-300', 'border-0')}>{mockConnected ? <Cloud className="mr-1 h-3 w-3" /> : <CloudOff className="mr-1 h-3 w-3" />}{mockConnected ? 'MSW 已连接' : '连接模拟接口'}</Badge>
+            <Badge className="border-0 bg-blue-500/15 text-blue-200"><UserCheck className="mr-1 h-3 w-3" />{mode === 'translate' ? CURRENT_TRANSLATOR : CURRENT_REVIEWER}</Badge>
             <Badge className={cn('border-0', dirty ? 'bg-amber-500/15 text-amber-300' : 'bg-slate-700 text-slate-200')}>{saveMutation.isPending ? <Loader2 className="mr-1 h-3 w-3 animate-spin" /> : <Save className="mr-1 h-3 w-3" />}{saveMutation.isPending ? '保存中' : dirty ? '草稿未保存' : '已持久化'}</Badge>
           </div>
           <div className="header-actions ml-auto flex items-center gap-2">
@@ -352,12 +527,25 @@ export function LocalizationWorkbench() {
             <CardContent>
               <p className="mb-3 text-[11px] leading-relaxed text-slate-500">在段落标题处勾选需要退回的片段，填写原因后统一提交。</p>
               <Textarea value={returnReason} onChange={(event) => setReturnReason(event.target.value)} rows={3} className="text-xs" />
+              <label className="mt-2 flex cursor-pointer items-center gap-1.5 text-[10px] text-slate-500">
+                <input type="checkbox" checked={simulateReviewFailure} onChange={(event) => setSimulateReviewFailure(event.target.checked)} className="h-3 w-3 rounded border-slate-300 accent-blue-600" />
+                模拟服务端退回失败（演示片段留在本地等待重试）
+              </label>
               <Button className="mt-3 w-full" variant="destructive" disabled={!selectedForReturn.size || reviewMutation.isPending} onClick={bulkReturn}>{reviewMutation.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : <UndoDot className="h-4 w-4" />}批量退回 {selectedForReturn.size || ''}</Button>
             </CardContent>
           </Card>
         </aside>
 
         <section className="workbench-center min-w-0 space-y-3">
+          {pendingReturns.length > 0 && (
+            <div className="flex flex-wrap items-center gap-2 rounded-xl border border-amber-200 bg-amber-50 px-3.5 py-2.5 text-xs text-amber-800">
+              <CloudOff className="h-4 w-4 shrink-0" />
+              <span>{pendingReturns.length} 条退回请求因服务端失败留在本地，等待重试</span>
+              <Button size="sm" variant="outline" className="ml-auto border-amber-300 bg-white text-amber-800 hover:bg-amber-100" disabled={reviewMutation.isPending} onClick={() => pendingReturns.forEach((pending) => retryPendingReturn(pending))}>
+                {reviewMutation.isPending ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}全部重试
+              </Button>
+            </div>
+          )}
           <div className="flex flex-wrap items-center gap-2 rounded-xl border bg-white p-2.5 shadow-sm">
             <div className="flex items-center rounded-lg bg-slate-100 p-1">
               {([['all', '全部'], ['issues', '问题'], ['untranslated', '漏译'], ['confirmed', '已确认']] as const).map(([value, label]) => <button key={value} onClick={() => setFilter(value)} className={cn('rounded-md px-3 py-1.5 text-xs font-medium transition', filter === value ? 'bg-white text-blue-700 shadow-sm' : 'text-slate-500 hover:text-slate-800')}>{label}</button>)}
@@ -369,6 +557,8 @@ export function LocalizationWorkbench() {
             const segmentIssues = issueMap[segment.id] ?? []
             const isSelected = selectedSegment?.id === segment.id
             const isReturnSelected = selectedForReturn.has(segment.id)
+            const isMine = segment.claimedBy === CURRENT_TRANSLATOR
+            const returnPending = pendingReturnIds.has(segment.id)
             return (
               <article id={`segment-${segment.id}`} key={segment.id} onClick={() => setSelectedSegmentId(segment.id)} className={cn('scroll-mt-32 overflow-hidden rounded-xl border bg-white shadow-sm transition', isSelected && 'ring-2 ring-blue-500/30', segment.status === 'returned' && 'border-red-200', segmentIssues.some((issue) => issue.severity === 'error') && 'border-red-200')}>
                 <header className="flex flex-wrap items-center gap-2 border-b bg-slate-50/80 px-3 py-2.5">
@@ -376,10 +566,19 @@ export function LocalizationWorkbench() {
                   <span className="text-[11px] font-semibold text-slate-500">#{String(segment.index).padStart(2, '0')}</span>
                   <Badge variant="outline" className="gap-1 text-[10px]">{kindIcon[segment.kind]}{kindLabel[segment.kind]}</Badge>
                   <span className={cn('rounded-full px-2 py-0.5 text-[10px] font-medium', statusClass[segment.status])}>{statusLabel[segment.status]}</span>
+                  {returnPending && <Badge className="gap-1 border-0 bg-amber-100 text-[10px] text-amber-800"><CloudOff className="h-3 w-3" />退回待重试</Badge>}
                   {segment.protectedTokens.length > 0 && <Badge variant="secondary" className="gap-1 text-[10px]"><Variable className="h-3 w-3" />{segment.protectedTokens.length} 个受保护标记</Badge>}
+                  {mode === 'translate' && (isMine
+                    ? <Badge className="gap-1 border-0 bg-blue-100 text-[10px] text-blue-800"><UserCheck className="h-3 w-3" />我认领的</Badge>
+                    : segment.claimedBy
+                      ? <Badge variant="secondary" className="gap-1 text-[10px]"><Lock className="h-3 w-3" />{segment.claimedBy} 已认领</Badge>
+                      : <Badge variant="outline" className="text-[10px]">未认领</Badge>)}
                   {!!segmentIssues.length && <Badge variant="destructive" className="ml-auto">{segmentIssues.length} 个问题</Badge>}
                   <div className={cn('flex gap-1.5', !segmentIssues.length && 'ml-auto')}>
-                    {mode === 'review' && <><Button size="sm" variant="outline" className="border-emerald-300 text-emerald-700 hover:bg-emerald-50" onClick={(event) => { event.stopPropagation(); updateStatus(segment.id, 'confirmed') }}><Check className="h-3.5 w-3.5" />确认</Button><Button size="sm" variant="outline" className="border-red-200 text-red-700 hover:bg-red-50" onClick={(event) => { event.stopPropagation(); updateStatus(segment.id, 'returned') }}><X className="h-3.5 w-3.5" />退回</Button></>}
+                    {mode === 'translate' && !isMine && <Button size="sm" variant="outline" className="border-blue-300 text-blue-700 hover:bg-blue-50" disabled={claimMutation.isPending} onClick={(event) => { event.stopPropagation(); claimMutation.mutate({ segmentId: segment.id, action: 'claim' }) }}><UserPlus className="h-3.5 w-3.5" />认领</Button>}
+                    {mode === 'translate' && isMine && <Button size="sm" variant="ghost" className="text-slate-500 hover:text-slate-800" disabled={claimMutation.isPending} onClick={(event) => { event.stopPropagation(); claimMutation.mutate({ segmentId: segment.id, action: 'release' }) }}>释放认领</Button>}
+                    {returnPending && <Button size="sm" variant="outline" className="border-amber-300 text-amber-800 hover:bg-amber-50" disabled={reviewMutation.isPending} onClick={(event) => { event.stopPropagation(); const pending = pendingReturns.find((item) => item.segmentIds.includes(segment.id)); if (pending) retryPendingReturn(pending) }}><RefreshCw className="h-3.5 w-3.5" />重试退回</Button>}
+                    {mode === 'review' && <><Button size="sm" variant="outline" className="border-emerald-300 text-emerald-700 hover:bg-emerald-50" onClick={(event) => { event.stopPropagation(); requestConfirm(segment.id) }}><Check className="h-3.5 w-3.5" />确认</Button><Button size="sm" variant="outline" className="border-red-200 text-red-700 hover:bg-red-50" onClick={(event) => { event.stopPropagation(); requestReturn(segment.id) }}><X className="h-3.5 w-3.5" />退回</Button></>}
                   </div>
                 </header>
                 <div className="compare-grid grid grid-cols-2 divide-x">
@@ -389,13 +588,33 @@ export function LocalizationWorkbench() {
                     {segment.note && <p className="mt-3 rounded-md bg-amber-50 px-2.5 py-1.5 text-[10px] text-amber-700">译者备注：{segment.note}</p>}
                   </div>
                   <div className="min-w-0 p-3.5">
-                    <div className="mb-2 flex items-center justify-between"><span className="text-[10px] font-semibold uppercase tracking-wider text-blue-500">简体中文 · Target</span>{mode === 'translate' ? <Badge variant="outline" className="text-[9px]">编辑中</Badge> : <Badge variant="secondary" className="text-[9px]">审校只读</Badge>}</div>
-                    <Textarea id={`target-${segment.id}`} value={segment.targetText} readOnly={mode === 'review'} onChange={(event) => updateTarget(segment, event.target.value)} rows={Math.max(3, Math.ceil(segment.sourceText.length / 46))} className={cn('min-h-[84px] resize-y border-slate-200 bg-slate-50/40 text-sm leading-6 focus-visible:bg-white', segment.kind === 'code' && 'markdown-code text-xs')} placeholder="在此输入译文，或保留代码块原样…" />
+                    <div className="mb-2 flex items-center justify-between"><span className="text-[10px] font-semibold uppercase tracking-wider text-blue-500">简体中文 · Target</span>
+                      {mode === 'review'
+                        ? <Badge variant="secondary" className="text-[9px]">审校只读</Badge>
+                        : isMine
+                          ? <Badge variant="outline" className="text-[9px]">编辑中</Badge>
+                          : <Badge variant="secondary" className="gap-1 text-[9px]"><Lock className="h-2.5 w-2.5" />{segment.claimedBy ? '他人认领 · 只读' : '未认领 · 只读'}</Badge>}
+                    </div>
+                    <Textarea id={`target-${segment.id}`} value={segment.targetText} readOnly={mode === 'review' || !isMine} onChange={(event) => updateTarget(segment, event.target.value)} rows={Math.max(3, Math.ceil(segment.sourceText.length / 46))} className={cn('min-h-[84px] resize-y border-slate-200 bg-slate-50/40 text-sm leading-6 focus-visible:bg-white', segment.kind === 'code' && 'markdown-code text-xs', !isMine && mode === 'translate' && 'cursor-not-allowed bg-slate-100/60 text-slate-500')} placeholder={mode === 'review' ? '审校只读…' : isMine ? '在此输入译文，或保留代码块原样…' : segment.claimedBy ? `该片段由 ${segment.claimedBy} 认领，译文只读，可在右侧讨论区留言` : '认领后即可编辑译文'} />
                     {segment.protectedTokens.length > 0 && <div className="mt-2 flex flex-wrap gap-1">{segment.protectedTokens.map((token) => <code key={token} className="rounded bg-blue-50 px-1.5 py-0.5 text-[10px] text-blue-700">{token}</code>)}</div>}
                   </div>
                 </div>
+                {segment.status === 'returned' && segment.returnReason && isMine && (
+                  <div className="border-t bg-amber-50 px-3.5 py-2.5">
+                    <div className="flex items-start gap-2 text-[11px] text-amber-800">
+                      <UndoDot className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                      <div>
+                        <p className="font-semibold">审校退回原因（仅认领人可见）{keptLocalIds.has(segment.id) ? '· 本地未提交改动已保留' : ''}</p>
+                        <p className="mt-0.5 leading-relaxed">{segment.returnReason}</p>
+                      </div>
+                    </div>
+                  </div>
+                )}
+                {segment.status === 'returned' && !isMine && (
+                  <div className="border-t bg-slate-50 px-3.5 py-1.5 text-[10px] text-slate-400">该片段已退回，退回原因仅发送给认领人{segment.claimedBy ? `（${segment.claimedBy}）` : ''}。</div>
+                )}
                 {!!segmentIssues.length && <div className="border-t bg-red-50/50 px-3.5 py-2.5"><div className="space-y-1.5">{segmentIssues.map((issue) => <div key={issue.id} className="flex items-start gap-2 text-[11px]"><CircleAlert className={cn('mt-0.5 h-3.5 w-3.5 shrink-0', issue.severity === 'error' ? 'text-red-600' : 'text-amber-600')} /><span className={issue.severity === 'error' ? 'text-red-700' : 'text-amber-700'}>{issue.message}</span></div>)}</div></div>}
-                <footer className="flex items-center gap-2 border-t bg-white px-3 py-2 text-[10px] text-slate-400"><span>点击正文可切换当前片段</span><span>·</span><span>MSW 本地校验</span><button className="ml-auto flex items-center gap-1 text-blue-600 hover:underline" onClick={(event) => { event.stopPropagation(); setSelectedSegmentId(segment.id); document.getElementById('discussion-tab')?.click() }}><MessageSquare className="h-3 w-3" />讨论 {discussions.filter((item) => item.segmentId === segment.id && !item.resolved).length}</button></footer>
+                <footer className="flex items-center gap-2 border-t bg-white px-3 py-2 text-[10px] text-slate-400"><span>点击正文可切换当前片段</span><span>·</span><span>MSW 本地校验</span>{dirtySegmentIds.has(segment.id) && <span className="flex items-center gap-1 text-amber-600"><span className="h-1.5 w-1.5 rounded-full bg-amber-500" />有未提交的本地改动</span>}<button className="ml-auto flex items-center gap-1 text-blue-600 hover:underline" onClick={(event) => { event.stopPropagation(); setSelectedSegmentId(segment.id); document.getElementById('discussion-tab')?.click() }}><MessageSquare className="h-3 w-3" />讨论 {discussions.filter((item) => item.segmentId === segment.id && !item.resolved).length}</button></footer>
               </article>
             )
           })}
@@ -420,7 +639,11 @@ export function LocalizationWorkbench() {
         </aside>
       </main>
 
-      {selectedForReturn.size > 0 && <div className="fixed bottom-0 left-0 right-0 z-50 border-t bg-slate-950 px-4 py-3 text-white shadow-2xl"><div className="mx-auto flex max-w-[1800px] items-center gap-3"><ShieldCheck className="h-4 w-4 text-amber-300" /><span className="text-xs">已选择 <b>{selectedForReturn.size}</b> 个片段</span><Input value={returnReason} onChange={(event) => setReturnReason(event.target.value)} className="ml-auto max-w-lg border-slate-700 bg-slate-900 text-white" /><Button variant="destructive" size="sm" onClick={bulkReturn}>确认批量退回</Button><Button variant="ghost" size="sm" className="text-slate-300" onClick={() => setSelectedForReturn(new Set())}>取消</Button></div></div>}
+      {selectedForReturn.size > 0 && <div className="fixed bottom-0 left-0 right-0 z-50 border-t bg-slate-950 px-4 py-3 text-white shadow-2xl"><div className="mx-auto flex max-w-[1800px] items-center gap-3"><ShieldCheck className="h-4 w-4 text-amber-300" /><span className="text-xs">已选择 <b>{selectedForReturn.size}</b> 个片段</span><Input value={returnReason} onChange={(event) => setReturnReason(event.target.value)} className="ml-auto max-w-lg border-slate-700 bg-slate-900 text-white" /><Button variant="destructive" size="sm" onClick={bulkReturn} disabled={reviewMutation.isPending}>{reviewMutation.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : null}确认批量退回</Button><Button variant="ghost" size="sm" className="text-slate-300" onClick={() => setSelectedForReturn(new Set())}>取消</Button></div></div>}
+
+      <div className="fixed bottom-4 right-4 z-[60] space-y-2">
+        {toasts.map((toast) => <div key={toast.id} className={cn('max-w-sm rounded-lg border px-3.5 py-2.5 text-xs leading-relaxed shadow-lg', toast.kind === 'error' && 'border-red-200 bg-red-50 text-red-800', toast.kind === 'success' && 'border-emerald-200 bg-emerald-50 text-emerald-800', toast.kind === 'info' && 'border-blue-200 bg-blue-50 text-blue-800')}>{toast.message}</div>)}
+      </div>
     </div>
   )
 }

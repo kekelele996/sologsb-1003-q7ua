@@ -12,6 +12,16 @@ export interface Segment {
   status: SegmentStatus
   protectedTokens: string[]
   note: string
+  /** 认领人（译者身份）；只有认领人能改译文，null 表示未认领 */
+  claimedBy: string | null
+  claimedAt?: number
+  /** 审校退回原因：服务端只下发给认领人本人，其他人不可见 */
+  returnReason?: string
+  returnedAt?: number
+  /** 投递该退回结果的服务端消息 id，用于去重 */
+  returnResultId?: string
+  /** 退回请求在服务端失败后留在本地等待重试的标记 */
+  returnPending?: boolean
 }
 
 export interface GlossaryTerm {
@@ -69,4 +79,23 @@ export interface LocalizationDocument {
   segments: Segment[]
   glossary: GlossaryTerm[]
   discussions: Discussion[]
+}
+
+/** 审校服务端产生的退回/确认结果，退回原因只投递给认领人 */
+export interface ReviewResult {
+  id: string
+  segmentId: string
+  action: 'return' | 'confirm'
+  reason?: string
+  reviewer: string
+  createdAt: number
+}
+
+/** 服务端退回失败后留在本地重试队列中的请求 */
+export interface PendingReturn {
+  tempId: string
+  segmentIds: string[]
+  reason: string
+  action: 'return'
+  createdAt: number
 }
